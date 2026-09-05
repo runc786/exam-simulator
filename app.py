@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 import time
+import re
 import streamlit.components.v1 as components
 from pypdf import PdfReader
 from google import genai
@@ -14,11 +15,9 @@ if "quiz_data" not in st.session_state:
 if "current_index" not in st.session_state:
     st.session_state.current_index = 0
 if "user_answers" not in st.session_state:
-    st.session_state.user_answers = {}  # {index: selected_option}
+    st.session_state.user_answers = {}
 if "exam_active" not in st.session_state:
     st.session_state.exam_active = False
-if "q_start_time" not in st.session_state:
-    st.session_state.q_start_time = time.time()
 if "time_per_q_sec" not in st.session_state:
     st.session_state.time_per_q_sec = 60
 if "marks_per_q" not in st.session_state:
@@ -37,31 +36,39 @@ def extract_text_from_pdf(uploaded_file):
     return text
 
 def parse_mcqs_with_ai(raw_text, api_key):
-    client = genai.Client(api_key=api_key)
+    # Clean any accidental spaces or hidden characters
+    clean_key = api_key.strip()
+    client = genai.Client(api_key=clean_key)
+    
     prompt = f"""
-    Extract all multiple-choice questions from the following text and return them in pure JSON format.
-    Return an array of objects where each object has:
-    - "question": string
-    - "options": list of 4 options (e.g., ["A) Option 1", "B) Option 2", ...])
-    - "correct_answer": the exact matching string of the correct option
-    - "explanation": brief explanation of why that answer is correct.
+    Extract multiple-choice questions from the following text and return them in a strict JSON array.
+    Each object must have these exact keys:
+    - "question": the question prompt
+    - "options": list of 4 options (e.g. ["A) ...", "B) ...", "C) ...", "D) ..."])
+    - "correct_answer": the full text or prefix of the correct option (e.g. "A) ...")
+    - "explanation": a concise explanation of why the answer is correct
 
     Raw Text:
-    {raw_text[:15000]}
+    {raw_text[:12000]}
     """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
+    
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
         )
-    )
-    return json.loads(response.text)
+        data = json.loads(response.text)
+        return data, None
+    except Exception as e:
+        return None, str(e)
 
-# --- Sidebar: Configuration & Controls ---
+# --- Sidebar: Controls ---
 with st.sidebar:
     st.header("⚙️ Exam Setup")
-    api_key = st.text_input("Gemini API Key", type="password")
+    api_key = st.text_input("Gemini API Key", type="password", help="Paste your key from Google AI Studio")
     uploaded_file = st.file_uploader("Upload MCQ PDF", type=["pdf"])
     
     time_limit_sec = st.number_input("Timer per Question (Seconds)", min_value=10, max_value=300, value=60, step=5)
@@ -71,20 +78,28 @@ with st.sidebar:
     negative_mark = st.number_input("Negative Marking Penalty", min_value=0.0, max_value=2.0, value=0.25, step=0.05)
     
     if st.button("Start Exam", use_container_width=True):
-        if uploaded_file and api_key:
-            with st.spinner("Extracting & parsing questions..."):
+        if uploaded_file and api_key.strip():
+            with st.spinner("Extracting & preparing questions..."):
                 raw_text = extract_text_from_pdf(uploaded_file)
-                st.session_state.quiz_data = parse_mcqs_with_ai(raw_text, api_key)
-                st.session_state.current_index = 0
-                st.session_state.user_answers = {}
-                st.session_state.marks_per_q = marks_per_q
-                st.session_state.negative_mark = negative_mark
-                st.session_state.time_per_q_sec = time_limit_sec
-                st.session_state.q_start_time = time.time()
-                st.session_state.exam_active = True
-                st.rerun()
+                if not raw_text.strip():
+                    st.error("No readable text found in PDF. Make sure it is not a scanned image PDF.")
+                else:
+                    parsed_questions, err = parse_mcqs_with_ai(raw_text, api_key)
+                    if err:
+                        st.error(f"API Error: {err}")
+                    elif not parsed_questions:
+                        st.warning("Could not extract MCQs from this document format.")
+                    else:
+                        st.session_state.quiz_data = parsed_questions
+                        st.session_state.current_index = 0
+                        st.session_state.user_answers = {}
+                        st.session_state.marks_per_q = marks_per_q
+                        st.session_state.negative_mark = negative_mark
+                        st.session_state.time_per_q_sec = time_limit_sec
+                        st.session_state.exam_active = True
+                        st.rerun()
         else:
-            st.warning("Please provide both an API key and an MCQ PDF.")
+            st.warning("Please provide both a valid Gemini API Key and upload an MCQ PDF.")
 
 # --- Exam Active Interface ---
 if st.session_state.exam_active and st.session_state.quiz_data:
@@ -92,14 +107,14 @@ if st.session_state.exam_active and st.session_state.quiz_data:
     idx = st.session_state.current_index
     current_q = st.session_state.quiz_data[idx]
 
-    # Top Status Bar: Per-Question Live Timer & Progress
     col_timer, col_prog = st.columns([1, 1])
 
     with col_timer:
         timer_duration = st.session_state.time_per_q_sec
+        # HTML/JS timer that resets on every question change
         timer_html = f"""
         <div style="font-family: sans-serif; background: #1e1e2f; color: #ff4b4b; padding: 10px 16px; border-radius: 8px; display: inline-block; font-weight: bold; font-size: 1.05rem; border: 1px solid #333;">
-            ⏱️ Question Timer: <span id="timer_display">{timer_duration}s</span>
+            ⏱️ Timer: <span id="timer_display">{timer_duration}s</span>
         </div>
         <script>
             let timeLeft = {timer_duration};
@@ -127,10 +142,10 @@ if st.session_state.exam_active and st.session_state.quiz_data:
 
     st.markdown("---")
 
-    # Display Question
+    # Question text
     st.markdown(f"#### **Q{idx + 1}. {current_q['question']}**")
 
-    # Option Selection
+    # Options
     prev_answer = st.session_state.user_answers.get(idx, None)
     selected_option = st.radio(
         "Choose option:",
@@ -142,7 +157,7 @@ if st.session_state.exam_active and st.session_state.quiz_data:
     if selected_option:
         st.session_state.user_answers[idx] = selected_option
 
-    # Immediate Evaluation & Feedback
+    # Feedback & Explanation
     if idx in st.session_state.user_answers:
         user_choice = st.session_state.user_answers[idx]
         is_correct = (user_choice.strip() == current_q["correct_answer"].strip())
@@ -154,17 +169,16 @@ if st.session_state.exam_active and st.session_state.quiz_data:
             st.info(f"**Correct Answer:** {current_q['correct_answer']}")
 
         with st.expander("📖 Explanation", expanded=True):
-            st.write(current_q.get("explanation", "No detailed explanation provided."))
+            st.write(current_q.get("explanation", "No explanation provided."))
 
     st.markdown("---")
 
-    # Navigation Controls
+    # Buttons
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
 
     with btn_col1:
         if st.button("⬅ Previous", disabled=(idx == 0), use_container_width=True):
             st.session_state.current_index -= 1
-            st.session_state.q_start_time = time.time()
             st.rerun()
 
     with btn_col2:
@@ -176,7 +190,6 @@ if st.session_state.exam_active and st.session_state.quiz_data:
         if idx < total_q - 1:
             if st.button("Next ➡", use_container_width=True):
                 st.session_state.current_index += 1
-                st.session_state.q_start_time = time.time()
                 st.rerun()
 
     # Question Quick-Jump Grid
@@ -186,10 +199,9 @@ if st.session_state.exam_active and st.session_state.quiz_data:
         tag = f"{i+1}✓" if i in st.session_state.user_answers else f"{i+1}"
         if grid_cols[i % 6].button(tag, key=f"nav_grid_{i}", use_container_width=True):
             st.session_state.current_index = i
-            st.session_state.q_start_time = time.time()
             st.rerun()
 
-# --- Post-Exam Scorecard ---
+# --- Post-Exam Result Screen ---
 elif not st.session_state.exam_active and st.session_state.quiz_data:
     st.title("📊 Examination Scorecard")
 
@@ -197,14 +209,8 @@ elif not st.session_state.exam_active and st.session_state.quiz_data:
     attempted = len(st.session_state.user_answers)
     unattempted = total_q - attempted
 
-    correct_count = 0
-    incorrect_count = 0
-
-    for i, ans in st.session_state.user_answers.items():
-        if ans.strip() == st.session_state.quiz_data[i]["correct_answer"].strip():
-            correct_count += 1
-        else:
-            incorrect_count += 1
+    correct_count = sum(1 for i, ans in st.session_state.user_answers.items() if ans.strip() == st.session_state.quiz_data[i]["correct_answer"].strip())
+    incorrect_count = attempted - correct_count
 
     positive_score = correct_count * st.session_state.marks_per_q
     negative_penalty = incorrect_count * st.session_state.negative_mark
@@ -217,10 +223,11 @@ elif not st.session_state.exam_active and st.session_state.quiz_data:
     m3.metric("Correct (+)", f"{correct_count}")
     m4.metric("Incorrect (-)", f"{incorrect_count}")
 
-    st.write(f"- **Attempted:** {attempted} / {total_q}")
+    st.write(f"- **Total Questions:** {total_q}")
+    st.write(f"- **Attempted:** {attempted}")
     st.write(f"- **Unattempted:** {unattempted}")
-    st.write(f"- **Positive Marks Gained:** +{positive_score:.2f}")
-    st.write(f"- **Negative Marks Deducted:** -{negative_penalty:.2f}")
+    st.write(f"- **Marks Gained:** +{positive_score:.2f}")
+    st.write(f"- **Marks Deducted:** -{negative_penalty:.2f}")
 
     st.markdown("---")
     review_col, restart_col = st.columns(2)
