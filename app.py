@@ -17,8 +17,10 @@ if "user_answers" not in st.session_state:
     st.session_state.user_answers = {}  # {index: selected_option}
 if "exam_active" not in st.session_state:
     st.session_state.exam_active = False
-if "end_time" not in st.session_state:
-    st.session_state.end_time = 0
+if "q_start_time" not in st.session_state:
+    st.session_state.q_start_time = time.time()
+if "time_per_q_sec" not in st.session_state:
+    st.session_state.time_per_q_sec = 60
 if "marks_per_q" not in st.session_state:
     st.session_state.marks_per_q = 1.0
 if "negative_mark" not in st.session_state:
@@ -62,7 +64,7 @@ with st.sidebar:
     api_key = st.text_input("Gemini API Key", type="password")
     uploaded_file = st.file_uploader("Upload MCQ PDF", type=["pdf"])
     
-    exam_duration = st.number_input("Timer (Minutes)", min_value=1, max_value=180, value=30)
+    time_limit_sec = st.number_input("Timer per Question (Seconds)", min_value=10, max_value=300, value=60, step=5)
     
     st.subheader("Marking Scheme")
     marks_per_q = st.number_input("Marks per Correct Question", min_value=0.5, max_value=5.0, value=1.0, step=0.25)
@@ -77,7 +79,8 @@ with st.sidebar:
                 st.session_state.user_answers = {}
                 st.session_state.marks_per_q = marks_per_q
                 st.session_state.negative_mark = negative_mark
-                st.session_state.end_time = int(time.time()) + (exam_duration * 60)
+                st.session_state.time_per_q_sec = time_limit_sec
+                st.session_state.q_start_time = time.time()
                 st.session_state.exam_active = True
                 st.rerun()
         else:
@@ -89,34 +92,31 @@ if st.session_state.exam_active and st.session_state.quiz_data:
     idx = st.session_state.current_index
     current_q = st.session_state.quiz_data[idx]
 
-    # Top Status Bar: Live Timer & Progress
+    # Top Status Bar: Per-Question Live Timer & Progress
     col_timer, col_prog = st.columns([1, 1])
 
     with col_timer:
-        target_timestamp_ms = st.session_state.end_time * 1000
+        timer_duration = st.session_state.time_per_q_sec
         timer_html = f"""
-        <div style="font-family: sans-serif; background: #1e1e2f; color: #ff4b4b; padding: 10px 16px; border-radius: 8px; display: inline-block; font-weight: bold; font-size: 1.1rem; border: 1px solid #333;">
-            ⏳ Time Left: <span id="timer_display">--:--</span>
+        <div style="font-family: sans-serif; background: #1e1e2f; color: #ff4b4b; padding: 10px 16px; border-radius: 8px; display: inline-block; font-weight: bold; font-size: 1.05rem; border: 1px solid #333;">
+            ⏱️ Question Timer: <span id="timer_display">{timer_duration}s</span>
         </div>
         <script>
-            const targetTime = {target_timestamp_ms};
-            function updateTimer() {{
-                const now = new Date().getTime();
-                const diff = targetTime - now;
-                if (diff <= 0) {{
-                    document.getElementById('timer_display').innerHTML = "TIME UP!";
-                    return;
+            let timeLeft = {timer_duration};
+            const display = document.getElementById('timer_display');
+            const countdown = setInterval(function() {{
+                timeLeft--;
+                if (timeLeft <= 0) {{
+                    clearInterval(countdown);
+                    display.innerHTML = "TIME UP!";
+                    display.style.color = "#ff3333";
+                }} else {{
+                    display.innerHTML = timeLeft + "s";
                 }}
-                const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-                const seconds = Math.floor((diff % (1000 * 60)) / 1000);
-                document.getElementById('timer_display').innerHTML = 
-                    (minutes < 10 ? "0" : "") + minutes + ":" + (seconds < 10 ? "0" : "") + seconds;
-            }}
-            updateTimer();
-            setInterval(updateTimer, 1000);
+            }}, 1000);
         </script>
         """
-        components.html(timer_html, height=60)
+        components.html(timer_html, height=55)
 
     with col_prog:
         st.metric(
@@ -142,7 +142,7 @@ if st.session_state.exam_active and st.session_state.quiz_data:
     if selected_option:
         st.session_state.user_answers[idx] = selected_option
 
-    # Immediate Evaluation & Negative Marking Indication
+    # Immediate Evaluation & Feedback
     if idx in st.session_state.user_answers:
         user_choice = st.session_state.user_answers[idx]
         is_correct = (user_choice.strip() == current_q["correct_answer"].strip())
@@ -158,12 +158,13 @@ if st.session_state.exam_active and st.session_state.quiz_data:
 
     st.markdown("---")
 
-    # Navigation Buttons
+    # Navigation Controls
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
 
     with btn_col1:
         if st.button("⬅ Previous", disabled=(idx == 0), use_container_width=True):
             st.session_state.current_index -= 1
+            st.session_state.q_start_time = time.time()
             st.rerun()
 
     with btn_col2:
@@ -175,6 +176,7 @@ if st.session_state.exam_active and st.session_state.quiz_data:
         if idx < total_q - 1:
             if st.button("Next ➡", use_container_width=True):
                 st.session_state.current_index += 1
+                st.session_state.q_start_time = time.time()
                 st.rerun()
 
     # Question Quick-Jump Grid
@@ -184,9 +186,10 @@ if st.session_state.exam_active and st.session_state.quiz_data:
         tag = f"{i+1}✓" if i in st.session_state.user_answers else f"{i+1}"
         if grid_cols[i % 6].button(tag, key=f"nav_grid_{i}", use_container_width=True):
             st.session_state.current_index = i
+            st.session_state.q_start_time = time.time()
             st.rerun()
 
-# --- Post-Exam Result Screen ---
+# --- Post-Exam Scorecard ---
 elif not st.session_state.exam_active and st.session_state.quiz_data:
     st.title("📊 Examination Scorecard")
 
